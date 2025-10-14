@@ -104,8 +104,25 @@ class T3StepCUDAGraphWrapper:
         static_tensors["max_position"] = bucket_key
 
         # Capture the graph
+        static_tensors["next_token_override"] = generated_ids.new_zeros(
+            (*generated_ids.shape[:1], 1)
+        )
+
         with torch.inference_mode():
-            with torch.cuda.graph(self._bucket_graphs[bucket_key]):
+            capture_kwargs = {}
+            try:
+                capture_kwargs["capture_mode"] = (
+                    torch.cuda.graphs.CaptureMode.RELAXED
+                )
+            except AttributeError:
+                # Older torch builds do not expose CaptureMode. Let torch pick the
+                # default capture mode instead of crashing during startup.
+                pass
+
+            with torch.cuda.graph(
+                self._bucket_graphs[bucket_key],
+                **capture_kwargs,
+            ):
                 static_tensors["out_1"], static_tensors["out_2"] = self.generate_token(
                     static_tensors["speech_embedding_cache"],
                     static_tensors["output_logits"],
@@ -123,6 +140,7 @@ class T3StepCUDAGraphWrapper:
                     static_tensors["stride_length"],
                     static_tensors["max_position"],
                     self.alignment_stream_analyzer,
+                    next_token_override=static_tensors["next_token_override"],
                 )
 
         # Store static tensors for this bucket
@@ -148,6 +166,7 @@ class T3StepCUDAGraphWrapper:
         max_position: Optional[int] = None,
         alignment_stream_analyzer: Any = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.alignment_stream_analyzer = alignment_stream_analyzer
         # Determine which bucket to use
         bucket_key = max_position or TOKEN_LIMIT
 
@@ -166,25 +185,33 @@ class T3StepCUDAGraphWrapper:
                 stride_length,
                 max_position,
             )
-        else:
-            # Update static tensors for this bucket and replay
-            static_tensors = self._bucket_static_tensors[bucket_key]
 
-            static_tensors["speech_embedding_cache"].copy_(speech_embedding_cache)
-            static_tensors["output_logits"].copy_(output_logits)
-            static_tensors["i_tensor"].copy_(i_tensor)
-            static_tensors["batch_idx"].copy_(batch_idx)
-            static_tensors["speech_pos_embedding_cache"].copy_(
-                speech_pos_embedding_cache
-            )
-            static_tensors["generated_ids"].copy_(generated_ids)
-            static_tensors["cfg_weight"] = cfg_weight
-            static_tensors["temperature"] = temperature
-            static_tensors["stride_length"] = stride_length
-            static_tensors["max_position"] = max_position
+        # Update static tensors for this bucket and replay
+        static_tensors = self._bucket_static_tensors[bucket_key]
 
-            # Replay the graph for this bucket
-            self._bucket_graphs[bucket_key].replay()
+        static_tensors["speech_embedding_cache"].copy_(speech_embedding_cache)
+        static_tensors["output_logits"].copy_(output_logits)
+        static_tensors["i_tensor"].copy_(i_tensor)
+        static_tensors["batch_idx"].copy_(batch_idx)
+        static_tensors["speech_pos_embedding_cache"].copy_(
+            speech_pos_embedding_cache
+        )
+        static_tensors["generated_ids"].copy_(generated_ids)
+        static_tensors["cfg_weight"] = cfg_weight
+        static_tensors["temperature"] = temperature
+        static_tensors["stride_length"] = stride_length
+        static_tensors["max_position"] = max_position
+        next_token = self._sample_next_token(
+            output_logits,
+            generated_ids,
+            cfg_weight,
+            temperature,
+            alignment_stream_analyzer,
+        )
+        static_tensors["next_token_override"].copy_(next_token)
+
+        # Replay the graph for this bucket
+        self._bucket_graphs[bucket_key].replay()
 
         # Return outputs from the appropriate bucket
         static_tensors = self._bucket_static_tensors[bucket_key]
@@ -212,3 +239,38 @@ class T3StepCUDAGraphWrapper:
 
     def mark_new_generation(self):
         self.kv_cache.reset()
+
+    def _sample_next_token(
+        self,
+        output_logits: torch.Tensor,
+        generated_ids: torch.Tensor,
+        cfg_weight: float,
+        temperature: float,
+        alignment_stream_analyzer: Any,
+    ) -> torch.Tensor:
+        logits = output_logits[:, -1, :]
+
+        if cfg_weight > 0.0:
+            logits_cond = logits[0:1]
+            logits_uncond = logits[1:2]
+            logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
+
+        logits = logits.squeeze(1)
+
+        if alignment_stream_analyzer is not None:
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+            seq_has_tokens = generated_ids.size(-1) > 0
+            last_token = generated_ids[0, -1].item() if seq_has_tokens else None
+            logits = alignment_stream_analyzer.step(logits, next_token=last_token)
+
+        logits = self.repetition_penalty_processor(generated_ids, logits)
+
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        logits = self.min_p_warper(None, logits)
+        logits = self.top_p_warper(None, logits)
+
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
