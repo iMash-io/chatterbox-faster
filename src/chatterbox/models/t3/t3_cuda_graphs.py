@@ -77,6 +77,9 @@ class T3StepCUDAGraphWrapper:
         temperature: float,
         stride_length: int,
         max_position: Optional[int] = None,
+        forced_next_token: Optional[torch.Tensor] = None,
+        use_forced_next_token: bool = False,
+        update_generated_ids: bool = True,
     ) -> None:
         """Capture the CUDA graph for a specific bucket."""
         print(
@@ -102,6 +105,13 @@ class T3StepCUDAGraphWrapper:
         static_tensors["temperature"] = temperature
         static_tensors["stride_length"] = stride_length
         static_tensors["max_position"] = bucket_key
+        static_tensors["forced_next_token"] = (
+            forced_next_token.clone()
+            if forced_next_token is not None
+            else torch.zeros_like(generated_ids[:, :1])
+        )
+        static_tensors["use_forced_next_token"] = use_forced_next_token
+        static_tensors["update_generated_ids"] = update_generated_ids
 
         # Capture the graph
         with torch.inference_mode():
@@ -120,10 +130,13 @@ class T3StepCUDAGraphWrapper:
                     self.top_p_warper,
                     self.patched_model,
                     self.kv_cache,  # Shared kv_cache
-                    static_tensors["stride_length"],
-                    static_tensors["max_position"],
-                    self.alignment_stream_analyzer,
-                )
+                static_tensors["stride_length"],
+                static_tensors["max_position"],
+                self.alignment_stream_analyzer,
+                static_tensors["forced_next_token"],
+                static_tensors["use_forced_next_token"],
+                static_tensors["update_generated_ids"],
+            )
 
         # Store static tensors for this bucket
         self._bucket_static_tensors[bucket_key] = static_tensors
@@ -147,6 +160,9 @@ class T3StepCUDAGraphWrapper:
         stride_length: int = 1,
         max_position: Optional[int] = None,
         alignment_stream_analyzer: Any = None,
+        forced_next_token: Optional[torch.Tensor] = None,
+        use_forced_next_token: bool = False,
+        update_generated_ids: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Determine which bucket to use
         bucket_key = max_position or TOKEN_LIMIT
@@ -165,6 +181,9 @@ class T3StepCUDAGraphWrapper:
                 temperature,
                 stride_length,
                 max_position,
+                forced_next_token,
+                use_forced_next_token,
+                update_generated_ids,
             )
         else:
             # Update static tensors for this bucket and replay
@@ -182,6 +201,13 @@ class T3StepCUDAGraphWrapper:
             static_tensors["temperature"] = temperature
             static_tensors["stride_length"] = stride_length
             static_tensors["max_position"] = max_position
+            if forced_next_token is not None:
+                static_tensors["forced_next_token"].copy_(forced_next_token)
+                static_tensors["use_forced_next_token"] = use_forced_next_token
+            else:
+                static_tensors["forced_next_token"].zero_()
+                static_tensors["use_forced_next_token"] = False
+            static_tensors["update_generated_ids"] = update_generated_ids
 
             # Replay the graph for this bucket
             self._bucket_graphs[bucket_key].replay()

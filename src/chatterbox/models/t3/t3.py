@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Resemble AI
 # MIT License
 import logging
-from typing import Union, Optional, List
+from typing import Callable, Union, Optional, List
 import time
 
 logger = logging.getLogger(__name__)
@@ -353,6 +353,8 @@ class T3(nn.Module):
         stride_length=4,
         skip_when_1=True,
         benchmark_t3=False,
+        stream_callback: Optional[Callable[[Tensor], None]] = None,
+        stream_stride: int = 1,
     ):
         """
         Args:
@@ -362,6 +364,20 @@ class T3(nn.Module):
         assert prepend_prompt_speech_tokens is None, "not implemented"
         _ensure_BOT_EOT(text_tokens, self.hp)
         text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
+
+        # Disable CUDA graphs when we are asked to stream intermediate tokens.
+        #
+        # The CUDA graph capture path relies on reusing a recorded graph for the
+        # entire decoding loop.  While this is great for throughput, it is not
+        # compatible with the streaming helpers because we sample tokens
+        # on-the-fly via ``torch.multinomial``.  Attempting to perform that
+        # stochastic sampling while a CUDA graph capture is in flight triggers
+        # ``cudaErrorStreamCaptureWrongThread`` errors ("operation not permitted
+        # when stream is capturing").  To keep streaming stable, fall back to the
+        # eager token generation backend when callbacks are provided.
+        use_forced_tokens = False
+        if generate_token_backend == "cudagraphs-manual" and stream_callback is not None:
+            use_forced_tokens = True
 
         # Default initial speech to a single start-of-speech token
         if initial_speech_tokens is None:
@@ -502,7 +518,9 @@ class T3(nn.Module):
             start = time.time()
             torch.cuda.synchronize() # For benchmarking to have correct it/s
         stride_length = stride_length if "stride" in generate_token_backend else 1
-        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True): 
+        last_callback_position = bos_len
+        stream_stride = max(1, stream_stride)
+        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True):
             i_tensor = indices[i * stride_length]
             # Check for EOS token.
             if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
@@ -519,6 +537,22 @@ class T3(nn.Module):
             torch.compiler.cudagraph_mark_step_begin()
             bucket_size = 250
             max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
+            forced_next_token = None
+            if use_forced_tokens:
+                forced_next_token = _select_next_token(
+                    output_logits[:, -1, :],
+                    batch_idx=batch_idx,
+                    i_tensor=i_tensor,
+                    generated_ids=generated_ids,
+                    cfg_weight=cfg_weight,
+                    temperature=temperature,
+                    repetition_penalty_processor=self.repetition_penalty_processor,
+                    min_p_warper=self.min_p_warper,
+                    top_p_warper=self.top_p_warper,
+                    alignment_stream_analyzer=self.patched_model.alignment_stream_analyzer,
+                    update_generated_ids=True,
+                )
+
             outputs = generate_token(
                 self._speech_embedding_cache,
                 output_logits,
@@ -536,11 +570,23 @@ class T3(nn.Module):
                 stride_length,
                 max_position=max_position,
                 alignment_stream_analyzer=self.patched_model.alignment_stream_analyzer,
+                forced_next_token=forced_next_token,
+                use_forced_next_token=use_forced_tokens,
+                update_generated_ids=not use_forced_tokens,
             )
             output_logits = outputs[1]
             if len(outputs) == 3:
                 generated_ids = outputs[2].clone()
             output_logits = output_logits.clone()
+
+            if stream_callback is not None:
+                should_emit = ((i + 1) % stream_stride == 0)
+                if should_emit:
+                    current_position = int(i_tensor.item())
+                    if current_position >= last_callback_position:
+                        tokens_for_callback = generated_ids[:, : current_position + 1].clone()
+                        stream_callback(tokens_for_callback)
+                        last_callback_position = current_position
 
             if i == max_new_tokens // stride_length - 1:
                 if benchmark_t3:
@@ -548,6 +594,16 @@ class T3(nn.Module):
                     print(f"Stopping at {(i + 1) * stride_length} because max_new_tokens reached")
                     print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
                     print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
+
+        if stream_callback is not None and last_callback_position < generated_ids.shape[-1]:
+            # Emit the latest tokens so the caller can finish streaming.
+            valid_positions = (generated_ids != PAD_TOKEN_ID).any(dim=0).nonzero()
+            if valid_positions.numel() > 0:
+                final_pos = int(valid_positions[-1].item())
+            else:
+                final_pos = last_callback_position
+            tokens_for_callback = generated_ids[:, : final_pos + 1].clone()
+            stream_callback(tokens_for_callback)
 
         return generated_ids
 
@@ -576,6 +632,59 @@ _initial_forward_pass_variants = {
 }
 
 
+def _select_next_token(
+    logits: Tensor,
+    *,
+    batch_idx: Tensor,
+    i_tensor: Tensor,
+    generated_ids: Tensor,
+    cfg_weight: float,
+    temperature: float,
+    repetition_penalty_processor: RepetitionPenaltyLogitsProcessor,
+    min_p_warper: MinPLogitsWarper,
+    top_p_warper: TopPLogitsWarper,
+    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None,
+    forced_next_token: Optional[Tensor] = None,
+    use_forced_next_token: bool = False,
+    update_generated_ids: bool = True,
+):
+    # CFG
+    if cfg_weight > 0.0:
+        logits_cond = logits[0:1]
+        logits_uncond = logits[1:2]
+        logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
+
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+
+    # Apply alignment stream analyzer integrity checks
+    if alignment_stream_analyzer is not None:
+        last_token = generated_ids[0, -1].item() if generated_ids.size(1) > 0 else None
+        print(logits, last_token)
+        logits = alignment_stream_analyzer.step(logits, next_token=last_token)
+
+    logits = repetition_penalty_processor(generated_ids, logits)
+
+    if not use_forced_next_token:
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        logits = min_p_warper(None, logits)
+        logits = top_p_warper(None, logits)
+
+        # Convert logits to probabilities and sample the next token.
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
+    else:
+        assert forced_next_token is not None
+        next_token = forced_next_token
+
+    if update_generated_ids:
+        generated_ids.index_put_((batch_idx, i_tensor), next_token.squeeze(-1))
+
+    return next_token
+
+
 def generate_t3_token(
     _speech_embedding_cache: Tensor,
     output_logits: Tensor,
@@ -592,41 +701,28 @@ def generate_t3_token(
     kv_cache: StaticCache,
     stride_length: int = 0, # for API simplicity
     max_position: Optional[int] = None,
-    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None
+    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None,
+    forced_next_token: Optional[Tensor] = None,
+    use_forced_next_token: bool = False,
+    update_generated_ids: bool = True,
 ):
     logits = output_logits[:, -1, :]
 
-    # CFG
-    if cfg_weight > 0.0:
-        logits_cond = logits[0:1]
-        logits_uncond = logits[1:2]
-        logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
-
-    logits = logits.squeeze(1)
-
-    # Apply alignment stream analyzer integrity checks
-    if alignment_stream_analyzer is not None:
-        if logits.dim() == 1:            # guard in case something upstream squeezed
-            logits = logits.unsqueeze(0) # (1, V)
-        # Pass the last generated token for repetition tracking
-        last_token = generated_ids[0, -1].item() if len(generated_ids[0]) > 0 else None
-        print(logits, last_token)
-        logits = alignment_stream_analyzer.step(logits, next_token=last_token)  # (1, V)
-
-    logits = repetition_penalty_processor(generated_ids, logits)
-
-    if temperature != 1.0:
-        logits = logits / temperature
-
-    logits = min_p_warper(None, logits)
-    logits = top_p_warper(None, logits)
-
-    # Convert logits to probabilities and sample the next token.
-    probs = torch.softmax(logits, dim=-1)
-    next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
-
-    # generated_ids[0, i + bos_len] = next_token.clone()
-    generated_ids.index_put_((batch_idx, i_tensor), next_token.squeeze(-1))
+    next_token = _select_next_token(
+        logits,
+        batch_idx=batch_idx,
+        i_tensor=i_tensor,
+        generated_ids=generated_ids,
+        cfg_weight=cfg_weight,
+        temperature=temperature,
+        repetition_penalty_processor=repetition_penalty_processor,
+        min_p_warper=min_p_warper,
+        top_p_warper=top_p_warper,
+        alignment_stream_analyzer=alignment_stream_analyzer,
+        forced_next_token=forced_next_token,
+        use_forced_next_token=use_forced_next_token,
+        update_generated_ids=update_generated_ids,
+    )
 
     # Get embedding for the new token.
     # position_embed = position_embeds[i_tensor]
@@ -663,7 +759,10 @@ def generate_t3_tokens_strided(
     kv_cache: StaticCache,
     stride_length: int,
     max_position: Optional[int] = None,
-    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None
+    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None,
+    forced_next_token: Optional[Tensor] = None,
+    use_forced_next_token: bool = False,
+    update_generated_ids: bool = True,
 ):
     for i in range(stride_length):
         next_token, output_logits = generate_t3_token(
@@ -682,9 +781,15 @@ def generate_t3_tokens_strided(
             kv_cache,
             stride_length,
             # max_position=max_position, # only use for cudagraphs-manual
-            alignment_stream_analyzer=alignment_stream_analyzer
+            alignment_stream_analyzer=alignment_stream_analyzer,
+            forced_next_token=forced_next_token,
+            use_forced_next_token=use_forced_next_token,
+            update_generated_ids=update_generated_ids,
         )
         output_logits = output_logits.clone()
+        forced_next_token = None
+        use_forced_next_token = False
+        update_generated_ids = True
     return next_token, output_logits
     
 
