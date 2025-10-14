@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -70,6 +71,12 @@ class _ModelRegistry:
             model = self._load_english()
         return model, {"sample_rate": getattr(model, "sr", 24_000)}
 
+    def preload_all(self) -> None:
+        LOGGER.info("Preloading English TTS backend")
+        self._load_english()
+        LOGGER.info("Preloading multilingual TTS backend")
+        self._load_multilingual()
+
 
 class SpeechRequest(BaseModel):
     """Body for POST /v1/audio/speech."""
@@ -100,6 +107,11 @@ class SpeechRequest(BaseModel):
 
 registry = _ModelRegistry()
 app = FastAPI(title="Chatterbox OpenAI-Compatible API", version="1.0.0")
+
+
+@app.on_event("startup")
+async def _preload_models() -> None:
+    await asyncio.to_thread(registry.preload_all)
 
 
 def _tensor_to_pcm16(chunk: torch.Tensor) -> bytes:

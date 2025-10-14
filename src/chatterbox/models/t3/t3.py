@@ -615,7 +615,8 @@ def generate_t3_token(
     kv_cache: StaticCache,
     stride_length: int = 0, # for API simplicity
     max_position: Optional[int] = None,
-    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None
+    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None,
+    next_token_override: Optional[Tensor] = None,
 ):
     logits = output_logits[:, -1, :]
 
@@ -646,7 +647,10 @@ def generate_t3_token(
 
     # Convert logits to probabilities and sample the next token.
     probs = torch.softmax(logits, dim=-1)
-    next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
+    if next_token_override is not None:
+        next_token = next_token_override.clone()
+    else:
+        next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
 
     # generated_ids[0, i + bos_len] = next_token.clone()
     generated_ids.index_put_((batch_idx, i_tensor), next_token.squeeze(-1))
@@ -686,7 +690,8 @@ def generate_t3_tokens_strided(
     kv_cache: StaticCache,
     stride_length: int,
     max_position: Optional[int] = None,
-    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None
+    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None,
+    next_token_override: Optional[Tensor] = None,
 ):
     for i in range(stride_length):
         next_token, output_logits = generate_t3_token(
