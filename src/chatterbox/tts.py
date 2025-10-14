@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal, Optional
+
+from queue import SimpleQueue
+from threading import Thread
 
 import librosa
 import torch
@@ -294,7 +297,148 @@ class ChatterboxTTS:
                 print(f"S3Gen inference time: {end - start:.2f} seconds")
                 wav = wav.squeeze(0).detach().cpu().numpy()
                 watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-                return torch.from_numpy(watermarked_wav).unsqueeze(0)
+            return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def generate_stream(
+        self,
+        text,
+        language_id,  # for API compatibility
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        max_new_tokens=1000,
+        max_cache_len=1500,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        t3_params={},
+        min_chunk_tokens: int = 10,
+    ) -> Iterator[torch.Tensor]:
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+            _cond: T3Cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
+            ).to(device=self.device)
+
+        text = punc_norm(text)
+        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+
+        if cfg_weight > 0.0:
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        min_chunk_tokens = max(1, min_chunk_tokens)
+
+        token_queue: SimpleQueue[tuple[str, object]] = SimpleQueue()
+
+        def _enqueue_tokens(tokens: torch.Tensor):
+            token_queue.put(("tokens", tokens.detach().clone()))
+
+        t3_kwargs = dict(t3_params)
+        stream_stride = int(t3_kwargs.pop("stream_stride", 1))
+
+        def _run_t3():
+            try:
+                with torch.inference_mode():
+                    final_tokens = self.t3.inference(
+                        t3_cond=self.conds.t3,
+                        text_tokens=text_tokens,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        cfg_weight=cfg_weight,
+                        max_cache_len=max_cache_len,
+                        repetition_penalty=repetition_penalty,
+                        min_p=min_p,
+                        top_p=top_p,
+                        stream_callback=_enqueue_tokens,
+                        stream_stride=stream_stride,
+                        **t3_kwargs,
+                    )
+                token_queue.put(("final", final_tokens.detach().clone()))
+            except Exception as exc:  # pragma: no cover - propagate downstream
+                token_queue.put(("error", exc))
+
+        producer = Thread(target=_run_t3, daemon=True)
+        producer.start()
+
+        cache_source = torch.zeros(1, 1, 0, device=self.device)
+        streamed_samples = 0
+        streamed_token_count = 0
+
+        def _process_tokens(raw_tokens: torch.Tensor, finalize: bool) -> Optional[torch.Tensor]:
+            nonlocal cache_source, streamed_samples, streamed_token_count
+
+            if raw_tokens is None:
+                return None
+
+            if raw_tokens.dim() == 2:
+                tokens = raw_tokens[0]
+            else:
+                tokens = raw_tokens
+
+            tokens = drop_invalid_tokens(tokens)
+            if tokens.numel() == 0:
+                return None
+
+            if not finalize and tokens.numel() <= streamed_token_count:
+                return None
+
+            if not finalize and tokens.numel() < min_chunk_tokens:
+                return None
+
+            tokens = tokens.to(self.device)
+
+            with torch.inference_mode():
+                output_wavs, cache_source = self.s3gen.inference(
+                    speech_tokens=tokens.unsqueeze(0),
+                    ref_dict=self.conds.gen,
+                    cache_source=cache_source,
+                    finalize=finalize,
+                )
+
+            wav = output_wavs.squeeze(0).detach().cpu().numpy()
+            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+            watermarked_tensor = torch.from_numpy(watermarked_wav).unsqueeze(0).to(torch.float32)
+
+            if watermarked_tensor.shape[-1] <= streamed_samples:
+                streamed_token_count = tokens.numel()
+                return None
+
+            chunk = watermarked_tensor[..., streamed_samples:]
+            streamed_samples = watermarked_tensor.shape[-1]
+            streamed_token_count = tokens.numel()
+
+            return chunk.squeeze(0)
+
+        try:
+            while True:
+                label, payload = token_queue.get()
+                if label == "tokens":
+                    audio_chunk = _process_tokens(payload, finalize=False)
+                    if audio_chunk is not None and audio_chunk.numel() > 0:
+                        yield audio_chunk
+                elif label == "final":
+                    audio_chunk = _process_tokens(payload, finalize=True)
+                    if audio_chunk is not None and audio_chunk.numel() > 0:
+                        yield audio_chunk
+                    break
+                elif label == "error":
+                    assert isinstance(payload, Exception)
+                    raise payload
+        finally:
+            producer.join()
 
             return speech_to_wav(speech_tokens)
 
