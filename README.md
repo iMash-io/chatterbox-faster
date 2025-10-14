@@ -87,6 +87,31 @@ ta.save("test-2.wav", wav, model.sr)
 ```
 See `example_tts.py` and `example_vc.py` for more examples.
 
+## OpenAI-Compatible Streaming API
+
+Chatterbox now exposes a production-ready FastAPI server that mirrors the OpenAI `/v1/audio/speech` contract while streaming audio in real time. The server emits Server-Sent Events (SSE) containing base64-encoded 16-bit PCM chunks so clients can start playback as soon as the first ~400 ms of audio is ready.
+
+Start the server:
+
+```bash
+uvicorn chatterbox.api:app --host 0.0.0.0 --port 8000
+```
+
+Request streaming synthesis (use `--no-buffer` so `curl` flushes events):
+
+```bash
+curl --no-buffer -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "faster_multi_api",
+        "input": "This is an example of what I want the TTS today.",
+        "language": "en",
+        "stream": true
+      }'
+```
+
+The response is an SSE stream with events named `response.metadata`, `response.output_audio.delta`, and `response.completed`. Each delta contains base64-encoded PCM16 that can be decoded and fed directly into an audio player for immediate playback. Set `language` to any of the 23 supported ISO codes when using the multilingual model.
+
 # Acknowledgements
 - [Cosyvoice](https://github.com/FunAudioLLM/CosyVoice)
 - [Real-Time-Voice-Cloning](https://github.com/CorentinJ/Real-Time-Voice-Cloning)

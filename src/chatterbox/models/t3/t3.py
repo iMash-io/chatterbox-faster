@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Resemble AI
 # MIT License
 import logging
-from typing import Union, Optional, List
+from typing import Callable, Union, Optional, List
 import time
 
 logger = logging.getLogger(__name__)
@@ -353,6 +353,8 @@ class T3(nn.Module):
         stride_length=4,
         skip_when_1=True,
         benchmark_t3=False,
+        stream_callback: Optional[Callable[[Tensor], None]] = None,
+        stream_stride: int = 1,
     ):
         """
         Args:
@@ -502,7 +504,9 @@ class T3(nn.Module):
             start = time.time()
             torch.cuda.synchronize() # For benchmarking to have correct it/s
         stride_length = stride_length if "stride" in generate_token_backend else 1
-        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True): 
+        last_callback_position = bos_len
+        stream_stride = max(1, stream_stride)
+        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True):
             i_tensor = indices[i * stride_length]
             # Check for EOS token.
             if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
@@ -542,12 +546,31 @@ class T3(nn.Module):
                 generated_ids = outputs[2].clone()
             output_logits = output_logits.clone()
 
+            if stream_callback is not None:
+                should_emit = ((i + 1) % stream_stride == 0)
+                if should_emit:
+                    current_position = int(i_tensor.item())
+                    if current_position >= last_callback_position:
+                        tokens_for_callback = generated_ids[:, : current_position + 1].clone()
+                        stream_callback(tokens_for_callback)
+                        last_callback_position = current_position
+
             if i == max_new_tokens // stride_length - 1:
                 if benchmark_t3:
                     torch.cuda.synchronize() # For benchmarking to have correct it/s
                     print(f"Stopping at {(i + 1) * stride_length} because max_new_tokens reached")
                     print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
                     print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
+
+        if stream_callback is not None and last_callback_position < generated_ids.shape[-1]:
+            # Emit the latest tokens so the caller can finish streaming.
+            valid_positions = (generated_ids != PAD_TOKEN_ID).any(dim=0).nonzero()
+            if valid_positions.numel() > 0:
+                final_pos = int(valid_positions[-1].item())
+            else:
+                final_pos = last_callback_position
+            tokens_for_callback = generated_ids[:, : final_pos + 1].clone()
+            stream_callback(tokens_for_callback)
 
         return generated_ids
 
