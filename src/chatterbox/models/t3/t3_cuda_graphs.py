@@ -108,10 +108,16 @@ class T3StepCUDAGraphWrapper:
             (*generated_ids.shape[:1], 1)
         )
 
+        graph_kwargs: Dict[str, Any] = {}
+        if hasattr(torch.cuda, "graphs") and hasattr(
+            torch.cuda.graphs, "CaptureMode"
+        ):
+            graph_kwargs["capture_mode"] = torch.cuda.graphs.CaptureMode.RELAXED
+
         with torch.inference_mode():
             with torch.cuda.graph(
                 self._bucket_graphs[bucket_key],
-                capture_mode=torch.cuda.graphs.CaptureMode.RELAXED,
+                **graph_kwargs,
             ):
                 static_tensors["out_1"], static_tensors["out_2"] = self.generate_token(
                     static_tensors["speech_embedding_cache"],
