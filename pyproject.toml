@@ -27,6 +27,8 @@ dependencies = [
     # "safetensors==0.5.3",
     "spacy-pkuseg",
     "pykakasi==2.3.0",
+    "fastapi",
+    "uvicorn[standard]",
     # "gradio==5.44.1",
 ]
 
