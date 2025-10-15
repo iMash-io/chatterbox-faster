@@ -195,7 +195,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         input_frame_rate: int = 25,
         only_mask_loss: bool = True,
         token_mel_ratio: int = 2,
-        pre_lookahead_len: int = 3,
+        pre_lookahead_len: int = 1,
         encoder: torch.nn.Module = None,
         decoder: torch.nn.Module = None,
         decoder_conf: Dict = {

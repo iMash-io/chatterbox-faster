@@ -105,7 +105,8 @@ class SDPlayer:
     - Low-latency: bounded queue, drops old data if producer outruns consumer.
     """
     def __init__(self, samplerate: int, channels: int, fmt: str,
-                 max_queue_secs: float = 0.5):
+                 max_queue_secs: float = 0.5,
+                 warmup_ms: float = 400.0):
         import sounddevice as sd  # local import so script works without it if using ffplay
         self.sd = sd
         self.samplerate = int(samplerate)
@@ -121,6 +122,9 @@ class SDPlayer:
         import threading
         self._lock = threading.Lock()
         self.max_bytes = max_frames * self.frame_bytes
+        # Prebuffer to smooth bursty server emission and avoid underruns
+        self.warmup_bytes = int((warmup_ms / 1000.0) * self.samplerate) * self.frame_bytes
+        self.warmed = False
         self.closed = False
 
         def _callback(outdata, frames, time_info, status):
@@ -128,15 +132,24 @@ class SDPlayer:
                 # underrun/overrun messages
                 print(status, file=sys.stderr)
             needed = frames * self.frame_bytes
-            out = bytearray(needed)
-            # Fill from persistent buffer; do not reorder or re-queue remainders
+
+            # Warmup: hold off draining until we have some buffer to avoid choppy playback
             with self._lock:
-                take = min(needed, len(self._buf))
+                have = len(self._buf)
+                if not self.warmed and have < self.warmup_bytes:
+                    # Output silence during warmup
+                    outdata[:needed] = b'\x00' * needed
+                    return
+                self.warmed = True
+
+                # Drain from buffer
+                take = min(needed, have)
                 if take:
-                    out[:take] = self._buf[:take]
+                    outdata[:take] = self._buf[:take]
                     del self._buf[:take]
-            # Remaining bytes are silence
-            outdata[:needed] = out
+                if take < needed:
+                    # Pad remainder with silence
+                    outdata[take:needed] = b'\x00' * (needed - take)
 
         self.stream = self.sd.RawOutputStream(
             samplerate=self.samplerate,

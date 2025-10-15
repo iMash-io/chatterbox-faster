@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import threading
+import time
 from typing import Dict, Iterable, Iterator, Optional
 
 import numpy as np
@@ -161,7 +162,15 @@ def _stream_to_sse(
     frame_samples = max(1, int(sample_rate * (frame_ms / 1000.0)))
     frame_bytes = frame_samples * channels * 2  # pcm16le: 2 bytes per sample
 
-    # metadata includes channels + suggested frame size for consumers (e.g., LiveKit)
+    # Emit slightly larger packets to reduce jitter/overhead
+    bundle_frames = 3  # 60 ms per SSE packet
+    bundle_bytes = bundle_frames * frame_bytes
+
+    # Prebuffer a bit to avoid initial underruns and skip leading silence
+    prebuffer_ms = 120.0
+    prebuffer_bytes = int(sample_rate * (prebuffer_ms / 1000.0)) * channels * 2
+
+    # metadata includes channels + suggested frame size and bundling for consumers
     yield _format_sse(
         "response.metadata",
         {
@@ -169,30 +178,61 @@ def _stream_to_sse(
             "format": "pcm16",
             "channels": channels,
             "frame_samples": frame_samples,
+            "bundle_frames": bundle_frames,
+            "prebuffer_ms": prebuffer_ms,
         },
     )
 
     buf = bytearray()
     frame_index = 0
+    started = False
+    last_ts = time.perf_counter()
     try:
         for chunk in chunks:
             pcm = _tensor_to_pcm16(chunk)
             buf.extend(pcm)
-            while len(buf) >= frame_bytes:
-                frame = bytes(buf[:frame_bytes])
-                del buf[:frame_bytes]
-                encoded = base64.b64encode(frame).decode("ascii")
+
+            # Wait until we have prebuffer before starting
+            if not started and len(buf) < max(prebuffer_bytes, bundle_bytes):
+                continue
+
+            # Drop leading fully-silent 20 ms frames (up to a limit) to avoid sending zeros
+            drop_checks = 0
+            max_drop_checks = 10
+            while not started and len(buf) >= frame_bytes and drop_checks < max_drop_checks:
+                test = buf[:frame_bytes]
+                if test.strip(b"\x00") == b"":
+                    del buf[:frame_bytes]
+                    drop_checks += 1
+                    continue
+                # non-silent frame encountered
+                started = True
+                break
+
+            # Emit in bundled frames for stability
+            while len(buf) >= bundle_bytes:
+                packet = bytes(buf[:bundle_bytes])
+                del buf[:bundle_bytes]
+
+                # Pace emission to real-time for the bundled duration
+                now = time.perf_counter()
+                target = last_ts + (bundle_frames * frame_ms / 1000.0)
+                if now < target:
+                    time.sleep(target - now)
+                last_ts = time.perf_counter()
+
+                encoded = base64.b64encode(packet).decode("ascii")
                 yield _format_sse(
                     "response.output_audio.delta",
                     {"index": frame_index, "audio": encoded},
                 )
-                frame_index += 1
+                frame_index += bundle_frames
     except Exception as exc:  # pragma: no cover - runtime safeguard
         LOGGER.exception("Streaming failure", exc_info=exc)
         yield _format_sse("response.error", {"message": str(exc)})
         return
 
-    # flush any tail shorter than frame_bytes
+    # flush any tail (emit one last packet even if shorter than bundle)
     if buf:
         encoded = base64.b64encode(bytes(buf)).decode("ascii")
         yield _format_sse(

@@ -234,10 +234,11 @@ class S3Token2Wav(S3Token2Mel):
             f0_predictor=f0_predictor,
         )
 
-        # silence out a few ms and fade audio in to reduce artifacts
-        n_trim = S3GEN_SR // 50  # 20ms = half of a frame
-        trim_fade = torch.zeros(2 * n_trim)
-        trim_fade[n_trim:] = (torch.cos(torch.linspace(torch.pi, 0, n_trim)) + 1) / 2
+        # shorten fade-in to reduce initial silence and artifacts (from ~20ms to ~5ms)
+        n_trim = S3GEN_SR // 200  # ~5ms at 24kHz
+        trim_fade = torch.zeros(2 * n_trim) if n_trim > 0 else torch.zeros(0)
+        if n_trim > 0:
+            trim_fade[n_trim:] = (torch.cos(torch.linspace(torch.pi, 0, n_trim)) + 1) / 2
         self.register_buffer("trim_fade", trim_fade, persistent=False) # (buffers get automatic device casting)
 
     def forward(
@@ -255,11 +256,13 @@ class S3Token2Wav(S3Token2Mel):
         # TODO jrm: ignoring the speed control (mel interpolation) and the HiFTGAN caching mechanisms for now.
         hift_cache_source = torch.zeros(1, 1, 0).to(self.device)
 
-        output_wavs, *_ = self.mel2wav.inference(speech_feat=output_mels, cache_source=hift_cache_source)
+        output_wavs, _ = self.hift_inference(speech_feat=output_mels, cache_source=hift_cache_source)
 
-        if not self.training:
+        if not self.training and output_wavs.shape[-1] > 0 and len(self.trim_fade) > 0:
             # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
-            output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
+            L = min(len(self.trim_fade), output_wavs.shape[-1])
+            if L > 0:
+                output_wavs[:, :L] *= self.trim_fade[:L]
 
         return output_wavs
 
@@ -280,6 +283,10 @@ class S3Token2Wav(S3Token2Mel):
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
         if cache_source is None:
             cache_source = torch.zeros(1, 1, 0).to(self.device)
+        # Guard: require a minimum number of mel frames before vocoder to avoid small-kernel errors
+        if (speech_feat is None) or (speech_feat.numel() == 0) or (speech_feat.shape[-1] < 4):
+            empty = torch.zeros(1, 1, 0).to(self.device)
+            return empty, cache_source
         return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
 
     @torch.inference_mode()
