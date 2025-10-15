@@ -3,7 +3,6 @@ from typing import List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchaudio.functional as AF
 from s3tokenizer.utils import padding
 from s3tokenizer.model_v2 import (
     S3TokenizerV2,
@@ -37,16 +36,38 @@ class S3Tokenizer(S3TokenizerV2):
 
         self.n_fft = 400
         n_freqs = self.n_fft // 2 + 1
-        fb = AF.create_fb_matrix(
-            n_freqs=n_freqs,
-            f_min=0.0,
-            f_max=float(S3_SR) / 2.0,
-            n_mels=int(config.n_mels),
-            sample_rate=int(S3_SR),
-            norm=None,
-            mel_scale="htk",
-        )
-        _mel_filters = fb.transpose(0, 1)  # (n_mels, n_freqs) to match librosa behavior
+
+        # Build mel filter bank without external deps (HTK scale)
+        def _hz_to_mel(f_hz: float) -> float:
+            return 2595.0 * np.log10(1.0 + (f_hz / 700.0))
+
+        def _mel_to_hz(mel: np.ndarray) -> np.ndarray:
+            return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+        mel_min = _hz_to_mel(0.0)
+        mel_max = _hz_to_mel(float(S3_SR) / 2.0)
+        mels = np.linspace(mel_min, mel_max, int(config.n_mels) + 2, dtype=np.float64)
+        hz = _mel_to_hz(mels)
+        bins = np.floor((self.n_fft + 1) * hz / float(S3_SR)).astype(int)
+
+        fb = np.zeros((int(config.n_mels), n_freqs), dtype=np.float32)
+        for i in range(1, int(config.n_mels) + 1):
+            f_m_minus, f_m, f_m_plus = bins[i - 1], bins[i], bins[i + 1]
+            # rising slope
+            if f_m > f_m_minus and f_m <= n_freqs:
+                start = max(f_m_minus, 0)
+                end = min(f_m, n_freqs)
+                if end > start:
+                    fb[i - 1, start:end] = (np.arange(start, end) - f_m_minus) / max(f_m - f_m_minus, 1)
+            # falling slope
+            if f_m_plus > f_m and f_m_plus <= n_freqs:
+                start = max(f_m, 0)
+                end = min(f_m_plus, n_freqs)
+                if end > start:
+                    fb[i - 1, start:end] = (f_m_plus - np.arange(start, end)) / max(f_m_plus - f_m, 1)
+
+        _mel_filters = torch.from_numpy(fb)
+
         self.register_buffer(
             "_mel_filters",
             _mel_filters.to(torch.float32),
