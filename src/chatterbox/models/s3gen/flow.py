@@ -94,6 +94,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
 
+
         # concat text and prompt_text
         mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
         token = self.input_embedding(torch.clamp(token, min=0, max=self.input_embedding.num_embeddings-1)) * mask
@@ -160,9 +161,12 @@ class MaskedDiffWithXvec(torch.nn.Module):
         mel_len1, mel_len2 = prompt_feat.shape[1], int(token_len2 / self.input_frame_rate * 22050 / 256)
         h, h_lengths = self.length_regulator.inference(h[:, :token_len1], h[:, token_len1:], mel_len1, mel_len2, self.input_frame_rate)
 
-        # get conditions
+        # get conditions (robust to prompt_feat length)
+        if prompt_feat.dim() == 2:
+            prompt_feat = prompt_feat.unsqueeze(0)
+        t1 = min(mel_len1, prompt_feat.shape[1])
         conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
-        conds[:, :mel_len1] = prompt_feat
+        conds[:, :t1] = prompt_feat[:, :t1, :]
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
@@ -254,6 +258,10 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         embedding = embedding.to(self.spk_embed_affine_layer.weight.dtype)
         prompt_feat = prompt_feat.to(self.spk_embed_affine_layer.weight.dtype)
 
+        # Ensure prompt_feat has batch dimension [B, T_mel, 80]
+        if prompt_feat.dim() == 2:
+            prompt_feat = prompt_feat.unsqueeze(0)
+
         assert token.shape[0] == 1
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
@@ -271,9 +279,12 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
         h = self.encoder_proj(h)
 
-        # get conditions
+        # get conditions (robust to prompt_feat length)
+        if prompt_feat.dim() == 2:
+            prompt_feat = prompt_feat.unsqueeze(0)
+        t1 = min(mel_len1, prompt_feat.shape[1])
         conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
-        conds[:, :mel_len1] = prompt_feat
+        conds[:, :t1] = prompt_feat[:, :t1, :]
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)

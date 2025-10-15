@@ -6,7 +6,6 @@ from queue import SimpleQueue
 from threading import Thread
 from typing import Iterator, Optional
 
-import librosa
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file as load_safetensors
@@ -206,6 +205,7 @@ class ChatterboxMultilingualTTS:
         return cls.from_local(ckpt_dir, device)
     
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
+        import librosa
         ## Load reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
@@ -418,12 +418,18 @@ class ChatterboxMultilingualTTS:
             tokens = tokens.to(self.device)
 
             with torch.inference_mode():
-                output_wavs, cache_source = self.s3gen.inference(
-                    speech_tokens=tokens.unsqueeze(0),
-                    ref_dict=self.conds.gen,
-                    cache_source=cache_source,
-                    finalize=finalize,
-                )
+                try:
+                    output_wavs, cache_source = self.s3gen.inference(
+                        speech_tokens=tokens.unsqueeze(0),
+                        ref_dict=self.conds.gen,
+                        cache_source=cache_source,
+                        finalize=finalize,
+                    )
+                except Exception as e:
+                    # Early in streaming the ref/cond lengths or token counts can be insufficient.
+                    # Skip emitting a chunk and wait for more tokens to arrive.
+                    print(f"S3Gen streaming decode skipped (mtl): {e}")
+                    return None
 
             wav = output_wavs.squeeze(0).detach().cpu().numpy()
             tensor = torch.from_numpy(wav).unsqueeze(0).to(torch.float32)

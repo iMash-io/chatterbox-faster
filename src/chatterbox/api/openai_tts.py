@@ -116,36 +116,24 @@ async def _preload_models() -> None:
     def _warm_sync():
         try:
             model_en, _ = registry.resolve("chatterbox-english", "en")
-            it = model_en.generate_stream(
+            _ = model_en.generate(
                 "Hello there.",
                 "en",
                 max_new_tokens=16,
                 max_cache_len=1500,
                 t3_params={"stream_stride": 1},
-                min_chunk_tokens=1,
             )
-            for _ in range(2):
-                try:
-                    next(it)
-                except StopIteration:
-                    break
         except Exception:
             LOGGER.exception("Warmup EN failed", exc_info=True)
         try:
             model_mu, _ = registry.resolve("faster_multi_api", "en")
-            it = model_mu.generate_stream(
+            _ = model_mu.generate(
                 "Hello there.",
                 "en",
                 max_new_tokens=16,
                 max_cache_len=1500,
                 t3_params={"stream_stride": 1},
-                min_chunk_tokens=1,
             )
-            for _ in range(2):
-                try:
-                    next(it)
-                except StopIteration:
-                    break
         except Exception:
             LOGGER.exception("Warmup MTL failed", exc_info=True)
 

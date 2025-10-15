@@ -1,9 +1,9 @@
 from typing import List, Tuple
 
 import numpy as np
-import librosa
 import torch
 import torch.nn.functional as F
+import torchaudio.functional as AF
 from s3tokenizer.utils import padding
 from s3tokenizer.model_v2 import (
     S3TokenizerV2,
@@ -36,14 +36,20 @@ class S3Tokenizer(S3TokenizerV2):
         super().__init__(name)
 
         self.n_fft = 400
-        _mel_filters = librosa.filters.mel(
-            sr=S3_SR,
-            n_fft=self.n_fft,
-            n_mels=config.n_mels
+        n_freqs = self.n_fft // 2 + 1
+        fb = AF.create_fb_matrix(
+            n_freqs=n_freqs,
+            f_min=0.0,
+            f_max=float(S3_SR) / 2.0,
+            n_mels=int(config.n_mels),
+            sample_rate=int(S3_SR),
+            norm=None,
+            mel_scale="htk",
         )
+        _mel_filters = fb.transpose(0, 1)  # (n_mels, n_freqs) to match librosa behavior
         self.register_buffer(
             "_mel_filters",
-            torch.FloatTensor(_mel_filters),
+            _mel_filters.to(torch.float32),
         )
 
         self.register_buffer(
