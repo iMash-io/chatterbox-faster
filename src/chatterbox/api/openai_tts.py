@@ -95,7 +95,7 @@ class SpeechRequest(BaseModel):
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     stream: bool = Field(default=True, description="Stream audio chunks as SSE events")
     response_format: str = Field(default="pcm16", description="Audio payload encoding")
-    min_chunk_tokens: int = Field(default=10, ge=1, description="Tokens to buffer before emitting the first chunk")
+    min_chunk_tokens: int = Field(default=2, ge=1, description="Tokens to buffer before emitting the first chunk")
     t3_params: Dict[str, float] = Field(default_factory=dict, description="Advanced overrides passed to T3.inference")
 
     @validator("response_format")
@@ -113,6 +113,44 @@ app = FastAPI(title="Chatterbox OpenAI-Compatible API", version="1.0.0")
 async def _preload_models() -> None:
     await asyncio.to_thread(registry.preload_all)
 
+    def _warm_sync():
+        try:
+            model_en, _ = registry.resolve("chatterbox-english", "en")
+            it = model_en.generate_stream(
+                "Hello there.",
+                "en",
+                max_new_tokens=16,
+                max_cache_len=1500,
+                t3_params={"stream_stride": 1},
+                min_chunk_tokens=1,
+            )
+            for _ in range(2):
+                try:
+                    next(it)
+                except StopIteration:
+                    break
+        except Exception:
+            LOGGER.exception("Warmup EN failed", exc_info=True)
+        try:
+            model_mu, _ = registry.resolve("faster_multi_api", "en")
+            it = model_mu.generate_stream(
+                "Hello there.",
+                "en",
+                max_new_tokens=16,
+                max_cache_len=1500,
+                t3_params={"stream_stride": 1},
+                min_chunk_tokens=1,
+            )
+            for _ in range(2):
+                try:
+                    next(it)
+                except StopIteration:
+                    break
+        except Exception:
+            LOGGER.exception("Warmup MTL failed", exc_info=True)
+
+    await asyncio.to_thread(_warm_sync)
+
 
 def _tensor_to_pcm16(chunk: torch.Tensor) -> bytes:
     array = chunk.detach().cpu().numpy()
@@ -126,20 +164,54 @@ def _format_sse(event: str, payload: Dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
 
-def _stream_to_sse(chunks: Iterable[torch.Tensor], sample_rate: int) -> Iterator[str]:
-    yield _format_sse("response.metadata", {"sample_rate": sample_rate, "format": "pcm16"})
+def _stream_to_sse(
+    chunks: Iterable[torch.Tensor],
+    sample_rate: int,
+    channels: int = 1,
+    frame_ms: float = 20.0,
+) -> Iterator[str]:
+    frame_samples = max(1, int(sample_rate * (frame_ms / 1000.0)))
+    frame_bytes = frame_samples * channels * 2  # pcm16le: 2 bytes per sample
+
+    # metadata includes channels + suggested frame size for consumers (e.g., LiveKit)
+    yield _format_sse(
+        "response.metadata",
+        {
+            "sample_rate": sample_rate,
+            "format": "pcm16",
+            "channels": channels,
+            "frame_samples": frame_samples,
+        },
+    )
+
+    buf = bytearray()
+    frame_index = 0
     try:
-        for index, chunk in enumerate(chunks):
+        for chunk in chunks:
             pcm = _tensor_to_pcm16(chunk)
-            encoded = base64.b64encode(pcm).decode("ascii")
-            yield _format_sse(
-                "response.output_audio.delta",
-                {"index": index, "audio": encoded},
-            )
+            buf.extend(pcm)
+            while len(buf) >= frame_bytes:
+                frame = bytes(buf[:frame_bytes])
+                del buf[:frame_bytes]
+                encoded = base64.b64encode(frame).decode("ascii")
+                yield _format_sse(
+                    "response.output_audio.delta",
+                    {"index": frame_index, "audio": encoded},
+                )
+                frame_index += 1
     except Exception as exc:  # pragma: no cover - runtime safeguard
         LOGGER.exception("Streaming failure", exc_info=exc)
         yield _format_sse("response.error", {"message": str(exc)})
         return
+
+    # flush any tail shorter than frame_bytes
+    if buf:
+        encoded = base64.b64encode(bytes(buf)).decode("ascii")
+        yield _format_sse(
+            "response.output_audio.delta",
+            {"index": frame_index, "audio": encoded},
+        )
+
     yield _format_sse("response.completed", {})
 
 
@@ -203,8 +275,9 @@ def create_speech(request: SpeechRequest):
             )
 
         return StreamingResponse(
-            _stream_to_sse(chunk_iterator, metadata["sample_rate"]),
+            _stream_to_sse(chunk_iterator, metadata["sample_rate"], channels=1),
             media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     with torch.inference_mode():
@@ -246,5 +319,6 @@ def create_speech(request: SpeechRequest):
             "audio": encoded,
             "format": request.response_format,
             "sample_rate": metadata["sample_rate"],
+            "channels": 1,
         }
     )

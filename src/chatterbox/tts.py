@@ -7,7 +7,6 @@ from threading import Thread
 
 import librosa
 import torch
-import perth
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
@@ -127,7 +126,6 @@ class ChatterboxTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
 
     @classmethod
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
@@ -266,38 +264,22 @@ class ChatterboxTTS:
                 **t3_params,
             )
 
-            
-            def speech_to_wav(speech_tokens):
-                # Extract only the conditional batch.
-                speech_tokens = speech_tokens[0]
+            # Extract only the conditional batch and drop invalid tokens
+            speech_tokens = speech_tokens[0]
+            speech_tokens = drop_invalid_tokens(speech_tokens)
 
-                # TODO: output becomes 1D
-                speech_tokens = drop_invalid_tokens(speech_tokens)
-                
-                def drop_bad_tokens(tokens):
-                    # Use torch.where instead of boolean indexing to avoid sync
-                    mask = tokens < 6561
-                    # Count valid tokens without transferring to CPU
-                    valid_count = torch.sum(mask).item()
-                    # Create output tensor of the right size
-                    result = torch.zeros(valid_count, dtype=tokens.dtype, device=tokens.device)
-                    # Use torch.masked_select which is more CUDA-friendly
-                    result = torch.masked_select(tokens, mask)
-                    return result
+            def drop_bad_tokens(tokens):
+                mask = tokens < 6561
+                return torch.masked_select(tokens, mask)
 
-                # speech_tokens = speech_tokens[speech_tokens < 6561]
-                speech_tokens = drop_bad_tokens(speech_tokens)
-                import time
-                start = time.time()
-                wav, _ = self.s3gen.inference(
-                    speech_tokens=speech_tokens,
-                    ref_dict=self.conds.gen,
-                )
-                end = time.time()
-                print(f"S3Gen inference time: {end - start:.2f} seconds")
-                wav = wav.squeeze(0).detach().cpu().numpy()
-                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-            return torch.from_numpy(watermarked_wav).unsqueeze(0)
+            speech_tokens = drop_bad_tokens(speech_tokens)
+
+            wav, _ = self.s3gen.inference(
+                speech_tokens=speech_tokens,
+                ref_dict=self.conds.gen,
+            )
+            wav = wav.squeeze(0).detach().cpu().numpy()
+        return torch.from_numpy(wav).unsqueeze(0)
 
     def generate_stream(
         self,
@@ -409,15 +391,14 @@ class ChatterboxTTS:
                 )
 
             wav = output_wavs.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-            watermarked_tensor = torch.from_numpy(watermarked_wav).unsqueeze(0).to(torch.float32)
+            tensor = torch.from_numpy(wav).unsqueeze(0).to(torch.float32)
 
-            if watermarked_tensor.shape[-1] <= streamed_samples:
+            if tensor.shape[-1] <= streamed_samples:
                 streamed_token_count = tokens.numel()
                 return None
 
-            chunk = watermarked_tensor[..., streamed_samples:]
-            streamed_samples = watermarked_tensor.shape[-1]
+            chunk = tensor[..., streamed_samples:]
+            streamed_samples = tensor.shape[-1]
             streamed_token_count = tokens.numel()
 
             return chunk.squeeze(0)
@@ -439,6 +420,3 @@ class ChatterboxTTS:
                     raise payload
         finally:
             producer.join()
-
-            return speech_to_wav(speech_tokens)
-

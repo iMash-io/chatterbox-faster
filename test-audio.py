@@ -117,7 +117,10 @@ class SDPlayer:
         approx_packet_frames = max(1, int(self.samplerate * 0.02))
         max_frames = int(max_queue_secs * self.samplerate)
         max_packets = max(2, max_frames // approx_packet_frames)
-        self.q: queue.Queue[bytes] = queue.Queue(maxsize=max_packets)
+        self._buf = bytearray()
+        import threading
+        self._lock = threading.Lock()
+        self.max_bytes = max_frames * self.frame_bytes
         self.closed = False
 
         def _callback(outdata, frames, time_info, status):
@@ -125,39 +128,22 @@ class SDPlayer:
                 # underrun/overrun messages
                 print(status, file=sys.stderr)
             needed = frames * self.frame_bytes
-            got = 0
-            # Fill a local buffer from queued audio
-            # (We avoid numpy entirely to keep this portable.)
-            buf = bytearray(needed)
-            mv = memoryview(buf)
-            # Pull queued packets until we fill or queue empties
-            while got < needed and not self.closed:
-                try:
-                    chunk = self.q.get_nowait()
-                except queue.Empty:
-                    break
-                take = min(len(chunk), needed - got)
-                mv[got:got+take] = chunk[:take]
-                got += take
-                # If chunk longer than we needed, push remainder back to front
-                if take < len(chunk):
-                    # put remainder at the front by rebuilding queue (rare path)
-                    remainder = chunk[take:]
-                    # It's OK to drop; but we try to preserve by immediate put_nowait
-                    try:
-                        self.q.put_nowait(remainder)
-                    except queue.Full:
-                        pass
-                    break
-            # If not enough data, remaining bytes stay zero (silence).
-            outdata[:needed] = buf
+            out = bytearray(needed)
+            # Fill from persistent buffer; do not reorder or re-queue remainders
+            with self._lock:
+                take = min(needed, len(self._buf))
+                if take:
+                    out[:take] = self._buf[:take]
+                    del self._buf[:take]
+            # Remaining bytes are silence
+            outdata[:needed] = out
 
         self.stream = self.sd.RawOutputStream(
             samplerate=self.samplerate,
             channels=self.channels,
             dtype=self.dtype,
             callback=_callback,
-            blocksize=0,          # backend decides; latency governed by feed rate & queue depth
+            blocksize=approx_packet_frames,  # ~20ms blocks for stable low-latency playback
         )
         self.stream.start()
 
@@ -171,16 +157,17 @@ class SDPlayer:
     def write(self, raw_bytes: bytes):
         if self.closed:
             return
-        try:
-            self.q.put_nowait(raw_bytes)
-        except queue.Full:
-            # Drop old audio to keep latency bounded.
-            with self.q.mutex:
-                self.q.queue.clear()
-            try:
-                self.q.put_nowait(raw_bytes)
-            except queue.Full:
-                pass
+        if not raw_bytes:
+            return
+        # Append to persistent buffer; drop oldest bytes if overflow to bound latency
+        with self._lock:
+            overflow = (len(self._buf) + len(raw_bytes)) - self.max_bytes
+            if overflow > 0:
+                if overflow >= len(self._buf):
+                    self._buf.clear()
+                else:
+                    del self._buf[:overflow]
+            self._buf.extend(raw_bytes)
 
     def close(self):
         self.closed = True
@@ -414,4 +401,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
